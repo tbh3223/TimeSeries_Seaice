@@ -237,8 +237,9 @@ tem.remain=window(temall,start = c(2014,1),c(2015,12))
 
 ## 1.5 源代码
 
-\qquad 为了保证本文中数据的可验证性，我们将项目源代码上传至github以供参考，包括各部分的源代码，分析的文档以及生成报告的Rmd文件。
+\qquad 为了保证本文中数据的可验证性，我们将项目源代码上传至github[^10]以供参考，包括各部分的源代码，分析的文档以及生成报告的Rmd文件。
 
+[^10]:网址见https://github.com/tbh3223/TimeSeries_Seaice
 
 # 2 数据预处理
 
@@ -283,7 +284,7 @@ mmn
 
 ![北极海冰面积的SARIMA模型预测图](C:\Users\tbh32\Desktop\forecastnor1.png)
 
-\qquad 计算其MSE可得为0.1322581。
+\qquad 计算其MSE可得为0.113902。
 
 ## 3.2 时间序列基本分解模型
 
@@ -303,6 +304,15 @@ summary(lmr1)
 \qquad 并可以得到含趋势项的时序图（图7）。
 
 ![含趋势项的时序图](C:\Users\tbh32\Desktop\trendtsnorth.png)
+
+\qquad 检验二次项系数显著性:
+
+```{r echo=FALSE, warning=FALSE}
+yy <- c(sinorth)
+tt <- seq(length(sinorth))
+lmr2 <- lm(yy ~ tt+I(tt^2))
+summary(lmr2) 
+```
 
 \qquad 由参数显著性检验认为二次项系数为零，故认为该趋势不含二次及高次项，因为如果存在高次项,投影到二次项，系数不应该显著为0。
 
@@ -381,7 +391,7 @@ plot(m1,which=9)
 
 ![北极海冰面积的基本分解模型预测图](C:\Users\tbh32\Desktop\forecastnor2.png)
 
-\qquad 计算其MSE可得为0.1128298。
+\qquad 计算其MSE可得为0.078740。
 
 ## 3.3 LOESS分解模型
 
