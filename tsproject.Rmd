@@ -1,0 +1,903 @@
+---
+output:
+  pdf_document: 
+    latex_engine: xelatex
+    includes:
+      in_header: header.tex
+    keep_tex: yes
+    toc: yes
+    toc_depth: 3
+  classoption: "hyperref,"
+
+---
+
+\newpage
+\pagebreak
+
+\par 
+
+**摘要:** 针对全球变暖与南北极海冰面积的相互影响，本文提出多种模型来对全球温度和海冰面积进行预测并尝试找出其因果关系。首先，基于Berkley Earth的全球温度数据和南北极海冰数据，本文通过对原始变量做回归和分解对缺失数据进行填补。其次，对每组数据进行独立建模，使用了ARIMA模型和GARCH模型，得到较好的预测效果。最后，考虑到温度与海冰面积的交互关系，使用VAR模型建模，找出了温度与南北极海冰的因果关系，验证了南北极海冰与温度的不平等关系，并得到较好的预测效果。
+
+**关键词:** 全球温度；海冰面积；LOESS；ARIMA；GARCH；VAR；预测
+
+\par
+
+**Abstract:** Considering the interaction between global warming and sea ice area in the Antarctic and the Arctic, some models are proposed in this paper to predict the global temperature and sea ice area and try to find out the causal relationship. First, based on global temperature data and  sea ice data of the Antarctic and Arctic from Berkley Earth, we fills in the missing data by linear regression and decomposition of the original variables. Secondly, each group of data is independently modeled, using ARMA model and GARCH model, and the  prediction is good. Finally, considering the interaction between temperature and sea ice area, we use VAR model to find the causal relationship between temperature and sea ice area in the Antarctic and Arctic, verifying the unequal relationship between sea ice and temperature in the Antarctic and Arctic, and get better prediction results.
+
+**Key words:** Global temperature; Sea ice;LOESS; ARIMA; GARCH; VAR;Forecast
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# 预备函数与包
+
+library(tseries)
+library("FinTS")
+library("forecast")
+library("fGarch")
+library(rugarch)
+library(showtext,quietly = TRUE) 
+library(zoo)
+library(vars)
+library(tseries)
+library(xtable)
+showtext::showtext_begin() 
+
+# 找到sidata中i年j月的海冰范围值
+findsi=function(sidata,i,j){
+  sidata[sidata$Year==i&sidata$Month==j,]$Extent
+}
+
+# 解决1988年1月的数据缺失问题
+# 将1-12日的值用前后两年对应值的平均估计
+# 再取1月平均值为代表
+# 其中1987年隔日测量，用前后两天平均值估计未测的值
+solve198801=function(sidata){
+  adj=c(14.089,findsi(sidata,1987,1))
+  ans1=numeric(12)
+  for (i in 1:12){
+    if(i %% 2 ==0){
+      ans1[i]=adj[(i/2+1)]
+    }
+    else{
+      ans1[i]=mean(c(adj[(i+1)/2],adj[(i+3)/2]))
+    }
+  } 
+  ans2=findsi(sidata,1989,1)[1:12]
+  ans=rowMeans(cbind(ans1,ans2))
+  ans=c(ans,findsi(sidata,1988,1))
+  mean(ans)
+}
+
+# 从sidata中提取海冰范围的时间序列数据
+get_ts=function(sidata){
+  extent=c()
+  for (i in 1978:2019) {
+    for (j in 1:12) {
+      aim=findsi(sidata,i,j)
+      if(length(aim)>0){
+        ans=mean(aim)
+        if(i==1987&j==12){
+          ans=mean(c(findsi(sidata,i-1,j),findsi(sidata,i+1,j)))
+        }
+        if(i==1988&j==1){
+          ans=solve198801(sidata)
+        }
+        extent=c(extent,ans)
+      }
+    }
+  }
+  exts=ts(extent,start = c(1978,10),frequency = 12)
+  #plot.ts(exts)
+  exts
+}
+
+# 得到趋势项分解中月平均值
+get.month=function(si.detrended){
+  month.av=numeric(12)
+  for (i in 1:12) {  # 这里i=1对应10月
+    month.i=si.detrended[seq(i,length(si.detrended),12)]
+    month.av[i]=mean(month.i)
+  }
+  month.av
+}
+
+# 画出以月平均为月周期项的趋势项分解图
+# 返回随机项
+plot.month <- function(yd, month0){ # input: Detrended series
+  ## month
+  month <- rep(month0, length=length(yd))
+  month <- ts(month, start=start(yd), frequency=12)
+  
+  ## Error
+  r <- c(yd) - month
+  r <- ts(r, frequency=12, start=start(yd))
+  r
+}
+
+#生成各阶检验的结果汇总表,一般是检验1到12阶,一般若
+#短期延迟之内不存在相关关系，长期之内更不会有
+#返回dataframe，若P＞0.05，认为接受其随机性
+box.text.collect <- function(data0){
+  lag = c()
+  Q.value = c()
+  p.value = c()
+  for(i in 1:12){
+    test = Box.test(data0,lag=i,type="Box-Pierce")
+    lag[i] = i
+    Q.value[i] = test$statistic
+    p.value[i] = test$p.value
+  }
+  data.frame(lag=lag,Q.value=Q.value,p.value=p.value)
+}
+
+#ARCH检验1到12阶
+arch.test.collect <- function(data0){
+  lag = c()
+  LM.value = c()
+  p.value = c()
+  for(i in 1:12){
+    test = ArchTest(data0*data0,lags=i)
+    lag[i] = i
+    LM.value[i] = test$statistic
+    p.value[i] = test$p.value
+  }
+  data.frame(lag=lag,LM.value=LM.value,p.value=p.value)
+}
+
+si=read.csv('C:/Users/tbh32/Desktop/daily-sea-ice-extent-data/seaice.csv',header = TRUE)
+sinorthdata=si[si$hemisphere=='north',1:4]
+sisouthdata=si[si$hemisphere=='south',1:4]
+
+sinorthall=get_ts(sinorthdata)
+sisouthall=get_ts(sisouthdata)
+
+## 首先的首先留两年做预测
+sinorth=ts(sinorthall[4:423],start=c(1979,1), frequency=12)
+sisouth=ts(sisouthall[4:423],start=c(1979,1), frequency=12)
+sinorth.remain=ts(sinorthall[424:447],start=c(2014,1), frequency=12)
+sisouth.remain=ts(sisouthall[424:447],start=c(2014,1), frequency=12)
+
+temdata=read.csv('C:/Users/tbh32/Desktop/climate-change-earth-surface-temperature-data/GlobalTemperatures.csv',header = TRUE)
+temall=temdata$LandAverageTemperature
+temall=ts(temall[1561:length(temall)],start = c(1880,1),frequency = 12)
+
+## 首先的首先留2年做预测
+tem=window(temall,start = c(1979,1),c(2013,12))
+tem.remain=window(temall,start = c(2014,1),c(2015,12))
+
+
+```
+
+
+
+\newpage
+\pagebreak
+
+# 1 课题介绍
+
+## 1.1 问题介绍
+
+\qquad 全球变暖一直以来都是倍受关注的问题。它是由于温室效应不断累积，导致地气系统吸收与发射的能量不平衡，能量不断累积，从而导致温度上升，造成全球变暖。它会产生极端天气，海平面上升等恶劣影响。其中，全球变暖导致的冰盖萎缩，冰川融化，海冰面积减小是导致海平面上升和一些极端天气的主要因素。\par
+\qquad 我们将以海冰面积和全球平均温度作为指标，研究全球变暖的情况。我们将分别建立南北极海冰面积和全球平均温度的模型，以预测未来一年的情况，再联合二者建立二维时间序列模型，进行因果推断和综合预测，给出适当建议。\par
+
+## 1.2 海冰介绍及相关研究介绍
+\qquad 海冰是冰冻的海水，它在海洋中形成，生长和融化。海冰仅在北极和南极存在。在北半球，它目前可以存在于中国渤海湾以南 [^1]，在南半球，海冰仅在南极洲附近[^2]形成。海冰在冬季增长，在夏季部分融化，在一年中部分时间，世界上约15%的海洋被海冰覆盖。  \par
+\qquad 虽然海冰主要发生在极地地区，但是它会对全球气候产生很大的影响[^3] 。这个影响主要来自四个方面：
+
+* **海冰的融化。**
+太阳光在赤道近乎垂直照射，而在极地地区则格外倾斜。太阳的角度是造成极地寒冷和赤道温暖的主要原因。海冰是白色的，所以它有很高的反照率，能反射约80%的太阳光。高反照率有助于保持极地的寒冷因为，海冰覆盖的区域不会吸收太多太阳能。但当气候变暖使得极地变暖并融化海冰时，极地区域的放射面减小，就会吸收更多热量，导致更多冰的融化，从而加速升温。这是一个正反馈回路，会改变大气的循环。
+
+* **大气与海洋环流。**
+大气和海洋是“热力发动机”，总是试图通过向极地输送热量来恢复温度平衡。我们的天气正是这种现象的表现。一些低压系统，比如风暴，在冬季特别强烈，是大自然通过大气环流向极地输送热量的最佳方式之一。相比之下，海洋倾向于以较慢且不太强烈的方式传递热量。海冰量的变化改变了极地的寒冷程度，这会影响大气和海洋的循环。另一方面，洋流通过温盐环流将热量从赤道传递到极地。温水从赤道沿着海面向北移动并最终冷却。随着它的冷却，它变得密集而沉重并且下沉。然后，这种冷水沿着海洋的下部向南移动，并在赤道附近上升以完成循环。与大气热传输一样，这是一个有助于在地球上实现适当温度平衡的自然过程。这也解释了为什么欧洲相对温暖，因为大西洋北部流动的地表水变冷，热量释放到大气中。
+
+* **海冰的移动。**
+海水通常是咸的，但凝结成冰时，会将盐分排出到冰下，这就使海冰中的水含盐量低，可以饮用。受北极风的影响，北极海冰会向南穿过弗拉姆海峡进入北大西洋时，它会融化，在海面上形成一层淡水。这种淡水的密度低于咸水，所以它往往会留在海洋的顶部。这种较低的密度阻碍了在支持温盐环流的高纬度（极地）下沉的正常过程，这使得温水从赤道向北移动变得更加困难。有力的证据表明，这种停滞过程发生在20世纪60年代末和70年代初期的几年，当时额外的淡水进入北大西洋并影响了北欧的气候。
+
+* **换热。**
+在冬季，北极的气候非常寒冷。相比之下，海洋更加温暖。海冰覆盖了两者，防止海洋中的热量加热上覆的大气层。这种隔热效果是海冰有助于保持北极寒冷的另一种方式。但是，热量可以从薄冰区域，特别是水道[^4] 和冰盖上的小开口，非常有效地逃逸。北冰洋与大气之间的总热交换大约有一半是通过冰洞中的开口发生的。随着更多的水道，冰盖开口或是更薄的冰，海冰无法有效地将海洋与大气隔绝。随后北极大气层变暖，就会影响大气的全球环流。
+
+\qquad 相较南极海冰，北极海冰在气候调节中的作用要更大，因此也更受人关注。这两者的差距主要源于它们的地理位置（见图1），北极的海洋是半封闭的，几乎完全被陆地包围，而南极洲是被海洋包围的陆地。开阔的海洋允许海冰更自由地移动，从而南极海冰比北极海冰更易于移动。而南极的北部没有陆地边界，海冰可以自由地向北漂浮到温暖的水域进而融化。这就使得南极冬季形成的几乎所有海冰都在夏季融化，冬季覆盖约1800万平方公里的海冰到夏末就仅剩约300万平方公里。相比之下，几乎被陆地包围的北极海冰虽然可以在北极盆地周围移动，但它往往仍留在寒冷的北极水域。浮冰更容易会聚，或相互撞击，从而堆积使冰层变厚。更厚的冰在夏季融化期间能更长地保持冰冻。因此，更多北极海冰在整个夏季仍然能留存下来，在冬季存在的约1500万平方公里的海冰，在夏末仍有约700万平方公里。
+
+![南北极海冰地理位置对比图[^5]，其中上部分是北极，下部分是南极](C:\Users\tbh32\Desktop\geo.jpg)
+
+\qquad 根据观测（见图2），该图显示了使用美国宇航局的海冰算法从海冰指数中计算得到的1979年至2018年的平均年海冰范围。最近三十年里，北极夏季海冰的厚度与范围均显著下降，其中冰层平均每年降低3%。这与对北极变暖的观察结果一致。这一趋势是极地地区气候变化的一个主要迹象，可能是全球变暖影响的一个指标。而自1979年以来，冬季北极冰面积相对于1981 年到2010年的平均值每十年下降约3％。南极冰的范围在所有月份都有一个小的增加趋势，但南极冰因其高变异性而更为显着。在从2012年到2014年每年9月创下历史最高纪录之后，南极在2016年，2017年和2018年的最大范围内最低。南极海冰似乎不太受全球变暖的影响，因为按照一般的气候模型，大气变得越来越热，加热了上层海水，这从下面增加了海冰的融化。此外，热量增加也将导致降雪减少，更多以雨水的形式降落。而雨水不能像雪花那样反射热量，这就从上层加速了南极海冰的融化。但实际情况却与之不全相符，这主要是因为南极洲是一个被水环绕的大陆，而北极则是被陆地包围的海洋。南极洲周围的风和洋流将该大陆与全球天气模式隔离开来，使其保持寒冷。相比之下，北冰洋与周围的气候系统密切相关，其对气候变化更加敏感。进一步的，有研究[^6] 表明南极海冰的变化与南极洲及周围海域的特殊地质环境有关。
+
+![南北极海冰范围趋势对比图[^7]](C:\Users\tbh32\Desktop\sicompare.png)
+
+[^1]:大约北纬38度。
+
+[^2]:在南纬55度以南。
+
+[^3]:这个影响主要来自北极海冰，下面也主要以北极海冰为例，后面会具体解释原因。
+
+[^4]:在流冰中裂开的一条可以航行的通道。
+
+[^5]:Credit: National Snow and Ice Data Center, University of Colorado, Boulder, Colorado.
+
+[^6]:见https://www.nasa.gov/feature/jpl/study-helps-explain-sea-ice-differences-at-earths-poles
+
+[^7]:Credit: National Snow and Ice Data Center, J.Stroeve
+
+
+## 1.3 数据简介
+
+\qquad 海冰面积数据来自kaggle整理的数据集[^8] ，原数据由National Snow & Ice Data Center收集的卫星拍摄的亮度数据[^9]生成的 。数据集提供1978年10月26日至20195月31日每天的总海冰范围，有7个变量：年，月，日，海冰面积，遗失值，来源链接和所在半球。原数据由于采集航天器的更改，1987年12月3日到1988年1月12日的数据存在缺失，且1987年12月3日前的数据由于航天器的功率限制，是隔天采集的，而1988年1月12日后的数据是每天采集的。
+
+\qquad 全球平均温度数据来自kaggle整理的数据集，原数据来自Berkeley Earth。数据集包括1750年到2015年每月的全球陆海平均温度及不确定度，还包括全球陆地平均最高，最低温度，陆地平均温度及不确定度等数据，但我们只采用全球陆海平均温度作为研究对象。
+
+[^8]:见https://www.kaggle.com/nsidcorg/daily-sea-ice-extent-data/
+
+[^9]:见https://nsidc.org/data/nsidc-0051
+
+
+## 1.4 章节安排与任务分工
+
+\qquad 我们将在第2节介绍我们对数据进行的预处理，主要是数据的增补与选择。第3到第5节我们将采用Sarima，时间序列基本分解和stl分解等模型，分别对北极海冰面积，南极海冰面积和全球平均温度来进行模型拟合与预测，并在每节最后对模型拟合效果进行评估。接下来在第六节里我们利用VAR模型和脉冲响应分析的理论，对综合的数据进行了VAR建模，并对模型进行了脉冲响应分析。最后，在第7节里我们对结果进行总结并尝试加以解释。
+
+\qquad 本课题中，涂博海负责数据的收集与预处理，以及汇总源代码后书写报告；李传赞负责提供第3-5节内容的源代码及分析；朱永鑫负责提供第6节源代码及分析。
+
+## 1.5 源代码
+
+\qquad 为了保证本文中数据的可验证性，我们将项目源代码上传至github以供参考，包括各部分的源代码，分析的文档以及生成报告的Rmd文件。
+
+
+# 2 数据预处理
+
+\qquad 海冰面积：我们首先将海冰面积数据分为南半球和北半球两个部分，并注意到遗失值相对面积数量级差距很大，忽略遗失值。然后将数据处理为月度数据，我们将每月所有海冰面积值的平均值作为月平均值。但注意到1987年12月3日到1988年1月12日存在数据缺失，对于1987年12月月平均值，我们舍去1987年12月的值，用相邻两年12月海冰面积的平均值作为代替；对于1988年1月月平均值，我们先将1月1日到1月12日的值用相邻两年的对应值的平均值做增补（1987年1月的值隔天记录，缺失值用相邻两天的值平均替代），再将该月的值做平均作为1月月平均值。
+
+\qquad 全球平均温度：注意到1850年前有部分数据缺失，我们提取需要部分的时间的全球陆海平均温度即可。
+
+\qquad 为了保持数据一致性，我们提取南北极海冰面积与全球平均温度在1979年1月到2015年12月的部分作为研究对象，且将2013年1月到2015年12月的数据留作验证集，其它数据供我们拟合模型。
+
+\newpage
+\pagebreak
+
+# 3 北极海冰面积的建模与预测
+
+\qquad 北极海冰面积时序图如图3，我们将在下面进行三种模型的尝试性建模。
+
+![北极海冰面积时序图](C:\Users\tbh32\Desktop\sinorth.png)
+
+## 3.1 季节性ARIMA模型
+
+### 3.1.1 模型构建
+
+\qquad 根据数据的特点，我们首先选取了季节性ARIMA模型进行构建，利用R语言的auto.arima，可以方便地进行初步的模拟。 模拟结果如下：
+
+```{r echo=FALSE, warning=FALSE}
+set.seed(10086)
+mmn=auto.arima(sinorth)
+mmn
+```
+
+\qquad 对其进行残差检验结果如图4,图5。
+
+![北极海冰面积的SARIMA模型残差检验结果图](C:\Users\tbh32\Desktop\tsdiagsinorth.png)
+
+![北极海冰面积的SARIMA模型残差检验结果图](C:\Users\tbh32\Desktop\lagParima.png)
+
+\qquad 残差检验结果显示，残差序列可视为白噪声序列，这说明拟合模型显著有效。
+
+### 3.1.2 模型的预测
+
+\qquad 利用forecast对模型进行预测，得到时序图如图6。
+
+![北极海冰面积的SARIMA模型预测图](C:\Users\tbh32\Desktop\forecastnor1.png)
+
+\qquad 计算其MSE可得为0.1322581。
+
+## 3.2 时间序列基本分解模型
+
+\qquad 对时间序列进行分解，分为趋势项、周期项和随机项，再分别对各项进行拟合，从而达到更加精确的预测。
+
+### 3.2.1 趋势项T的估计
+
+注意到时序图有明显趋势，先考虑一次曲线拟合，得到如下结果：
+
+```{r echo=FALSE, warning=FALSE}
+yy <- c(sinorth)
+tt <- seq(length(sinorth))
+lmr1 <- lm(yy ~ tt)
+summary(lmr1)
+```
+
+\qquad 并可以得到含趋势项的时序图（图7）。
+
+![含趋势项的时序图](C:\Users\tbh32\Desktop\trendtsnorth.png)
+
+\qquad 由参数显著性检验认为二次项系数为零，故认为该趋势不含二次及高次项，因为如果存在高次项,投影到二次项，系数不应该显著为0。
+
+### 3.2.2 周期项的估计
+
+\qquad 利用过去去除趋势项的数据中相同月份的均值作周期项的估计，从而得到下表中的数据。
+
+```{r echo=FALSE}
+## 去掉趋势项
+tr.more <- ts(predict(lmr1, newdata=list(tt=seq(length(sinorth)+24))),
+              frequency=12, start=c(1979,1))
+si.detrended = sinorth - tr.more[1:length(sinorth)]
+
+## 提取月周期项，并预测
+month0 = get.month(si.detrended)
+months.more <- ts(rep(month0,length=444),
+                start=start(sinorth), frequency=12)
+names(month0)=month.abb
+knitr::kable(t(month0),digits=4,caption = "北极海冰面积月周期项估计表")
+```
+
+### 3.2.3 随机项的估计
+
+\qquad 原数据减去趋势项和周期项的估计后得到随机项的估计，其时序图如下：
+
+```{r echo=FALSE,fig.showtext = TRUE}
+## 画出随机项的时序图
+err1 <- sinorth - tr.more[1:length(sinorth)] - months.more[1:length(sinorth)]
+plot.ts(err1,main='随机项的时序图')
+```
+
+\qquad 检验随机项是否平稳
+
+```{r echo=FALSE, warning=FALSE}
+## 检验随机项是否平稳
+adf.test(err1)
+```
+
+\qquad 因为P值小于0.05，拒绝原假设，可以认为序列平稳。
+
+\qquad 接下来，对随机项进行arima拟合，并进行残差检验,结果如下：
+
+```{r echo=FALSE}
+#利用auto.arima建模
+fit1 <- auto.arima(err1)
+fit1
+#图像观察法
+tsdiag(fit1)
+```
+
+\qquad 残差检验结果显示，残差序列基本可视为白噪声序列，但是为了更加精确地拟合预测，检验一下是否存在arch效应。其box-test和arch-test检验结果如下图8，图9。
+
+![box-test检验结果图](C:\Users\tbh32\Desktop\boxtestnor.png)
+
+![box-test检验结果图](C:\Users\tbh32\Desktop\archtestnor.png)
+
+\qquad 接受原假设，认为有异方差。
+
+\qquad 然后我们进行了多次产生尝试，发现尽管我们已经去除了周期项，但是周期的信息仍然存在，对模型的拟合产生了很大的影响，所以我们在本次模型构建中，先对残差项进行了12阶差分，再对新序列拟合arma-garch模型。拟合结果如下：
+
+```{r echo=FALSE}
+diff.err1 <- diff(err1,12)
+myspec=ugarchspec(variance.model = list(model = "sGARCH", garchOrder = c(1,1)), 
+                  mean.model = list(armaOrder = c(1,1),include.mean=TRUE,arfima = FALSE),
+                  distribution.model = "norm")
+
+err1.predict <- diff.err1.predict <- rep(NA,24)
+
+(m1 <- ugarchfit(data=diff.err1,spec=myspec))
+plot(m1,which=9)
+```
+
+### 3.2.4 模型的预测
+
+\qquad 利用趋势项、周期项、随机项的预测，随机项进行了二期滚动预测，趋势项和周期项直接预测，再相加得到最后的预测结果，可视化结果如图10：
+
+![北极海冰面积的基本分解模型预测图](C:\Users\tbh32\Desktop\forecastnor2.png)
+
+\qquad 计算其MSE可得为0.1128298。
+
+## 3.3 LOESS分解模型
+
+\qquad 尽管我们已经有了两个模型，但预测的效果不尽满意，这个模型中我们对分解的方法进行改进，采用LOESS分解法分解，基本思路是一样的，但这里的问题是LOESS分解得到的趋势并不是一个简单的线性趋势，那么我们又对趋势进行了建模拟合，在下面我们可以看到，这种花费大量时间尝试所得模型，对我们的预测很有帮助。
+
+\qquad 先对测试集数据进行LOESS分解，如下图所示：
+
+```{r echo=FALSE, warning=FALSE}
+# LOESS光滑做分解及预测
+s1=stl(sinorth,s.window='periodic') #periodic是表示季节项恒定
+plot(s1)
+```
+
+### 3.3.1 趋势项T的估计
+
+\qquad 在进行多项式拟合的过程中，发现二次曲线模型显著，利用其进行拟合。
+
+```{r echo=FALSE, warning=FALSE}
+trand4=s1$time.series[,2]
+
+#趋势项和周期项建模
+lm.stl.trend <- lm(trand4~tt+I(tt^2))
+summary(lm.stl.trend)
+```
+
+
+### 3.3.2 周期项的估计
+
+\qquad 利用过去去除趋势项的数据中相同月份的均值作周期项的估计，从而得到下表中的数据。
+
+![月周期估计值](C:\Users\tbh32\Desktop\monthlytsnor.png)
+
+### 3.3.3 随机项的估计
+
+\qquad 原始数据减去趋势项和月周期项得到随机项，对其做平稳性检验如下：
+```{r echo=FALSE, warning=FALSE}
+tr.more <- ts(predict(lm.stl.trend, newdata=list(tt=seq(length(sinorth)+24))),
+                               frequency=12, start=c(1979,1))
+si.detrended = sinorth - tr.more[1:length(sinorth)]
+seasonal.stl.predict <- get.month(si.detrended)
+seasonal.more <- ts(rep(seasonal.stl.predict,length=444),
+                  start=start(sinorth), frequency=12)
+si.pred <- tr.more + seasonal.more
+
+## 随机项建模
+err4=sinorth-si.pred
+adf.test(err4)
+```
+
+\qquad 拒绝原假设，可以认为序列平稳,下面用arima模型去拟合：
+
+```{r echo=FALSE, warning=FALSE}
+#利用auto.arima建模
+fit4 <- auto.arima(err4)
+fit4
+#图像观察法
+tsdiag(fit4)
+```
+
+\qquad 对其做box-text和arch-test,结果如图12。
+
+![box-text和arch-test检验值](C:\Users\tbh32\Desktop\archandbox.png)
+
+\qquad 可见存在arch效应，利用arma-garch模型进行拟合，残差项正态性良好，可以进行应用。下面进行拟合：
+
+```{r echo=FALSE, warning=FALSE}
+fit4.resi<-residuals(fit4,standardize=T)
+
+diff.err4 <- diff(err4,12)
+myspec=ugarchspec(variance.model = list(model = "sGARCH", garchOrder = c(1,1)), 
+                  mean.model = list(armaOrder = c(2,1),include.mean=TRUE,arfima = FALSE),
+                  distribution.model = "norm")
+
+err4.predict <- diff.err4.predict <- rep(NA,24)
+
+(m1 <- ugarchfit(data=diff.err4,spec=myspec))
+plot(m1,which=9)
+```
+
+### 3.3.4 模型的预测
+
+\qquad 对上述模型进行预测得到图13。
+
+![北极海冰面积的LOESS分解模型预测图](C:\Users\tbh32\Desktop\forecastnor3.png)
+
+\qquad 计算其MSE为0.061675
+
+
+## 3.4 预测结果对比与模型评论
+
+```{r echo=FALSE, warning=FALSE}
+temmse=matrix(c(0.113902,0.078740,0.061675),nrow=1,dimnames = list(c('MSE'),c('model1','model2','model3')))
+knitr::kable(temmse)
+```
+
+\qquad 其中modeli分别表示北极海冰面积的SARIMA模型，基本分解模型和LOESS分解模型。由MSE可见LOESS分解模型要优于另外两个模型。
+
+
+\newpage
+\pagebreak
+
+# 4 南极海冰面积的建模与预测
+\qquad 从北极海冰面积预测的结果来看，直接用auto.arima拟合预测远没有自己建模预测的好，接下来就类比北极海冰的后两个模型，建立南极海冰和温度的预测模型。\par
+
+\qquad 南极海冰面积时序图如图14。
+
+![南极海冰面积时序图](C:\Users\tbh32\Desktop\sisouth.png)
+
+## 4.1 时间序列的基本分解模型
+
+### 4.1.1 趋势项T的估计
+
+\qquad 时序图趋势不明显，考虑线性拟合
+
+```{r echo=FALSE, warning=FALSE}
+## 拟合趋势项
+sisouth=ts(sisouthall[4:423],start=c(1979,1), frequency=12)
+
+yy <- c(sisouth)
+tt <- seq(length(sisouth))
+lmr1 <- lm(yy ~ tt)
+summary(lmr1)
+```
+
+\qquad 我们发现一次项系数并不显著，利用均值进行趋势项的拟合。
+
+### 4.1.2 周期项的估计
+
+\qquad 利用过去去除趋势项的数据中相同月份的均值作周期项的估计，从而得到图15中的数据。
+
+![南极海冰月周期项估计图](C:\Users\tbh32\Desktop\monthlytssou.png)
+
+### 4.1.3 随机项的拟合
+
+```{r echo=FALSE, warning=FALSE,fig.showtext=TRUE}
+## 去掉趋势项
+tr.more <- rep(mean(sisouth),444)
+si.detrended = sisouth - tr.more[1:length(sisouth)]
+
+## 提取月周期项，并预测
+month0 = get.month(si.detrended)
+months.more <- ts(rep(month0,length=444),
+                  start=start(sisouth), frequency=12)
+si.pred <- tr.more + months.more
+## 画出随机项的时序图
+err1=plot.month(si.detrended,month0)
+
+#plot.ts(err1,main='随机项的时序图')
+```
+
+\qquad 对随机项检验平稳性
+
+```{r echo=FALSE, warning=FALSE,fig.showtext=TRUE}
+adf.test(err1)
+```
+
+\qquad 拒绝原假设，可以认为序列平稳。
+
+\qquad 用auto.arima建模并进行残差检验如下：
+
+```{r echo=FALSE, warning=FALSE}
+#利用auto.arima建模
+fit1 <- auto.arima(err1)
+fit1
+#图像观察法
+tsdiag(fit1)
+```
+
+\qquad 对残差进行box-test和arch-test结果如图16
+
+![box-test和arch-test检验结果](C:\Users\tbh32\Desktop\bt.png)
+
+
+
+### 4.1.4 模型的预测
+
+\qquad 利用趋势项、周期项、随机项进行预测。随机项进行了二期滚动预测，趋势项和周期项直接预测，再相加得到最后的预测结果，可视化结果如图17：
+
+![南极海冰面积的基本分解模型预测图](C:\Users\tbh32\Desktop\forecastsou1.png)
+
+\qquad 计算其MSE值为0.486908
+
+## 4.2 LOESS分解模型 
+
+\qquad 考虑用stl进行分解，分解结果如下：
+
+```{r echo=FALSE}
+s1=stl(sisouth,s.window='periodic') #periodic是表示季节项恒定
+plot(s1)
+
+```
+
+### 4.2.1 趋势项T的估计
+
+\qquad 考虑用一次项拟合趋势项结果如下：
+
+```{r echo=FALSE, warning=FALSE}
+trand4=s1$time.series[,2]
+
+#趋势项和周期项建模
+lm.stl.trend <- lm(trand4~tt+I(tt^2))
+summary(lm.stl.trend)
+```
+
+### 4.2.2 周期项的估计
+
+\qquad 我们将对应月的所有值的平均作为月周期项，结果如下：
+
+```{r echo=FALSE, warning=FALSE}
+tr.more <- ts(predict(lm.stl.trend, newdata=list(tt=seq(length(sisouth)+24))),
+              frequency=12, start=c(1979,1))
+si.detrended = sinorth - tr.more[1:length(sisouth)]
+seasonal.stl.predict <- get.month(si.detrended)
+seasonal.more <- ts(rep(seasonal.stl.predict,length=444),
+                    start=start(sisouth), frequency=12)
+si.pred <- tr.more + seasonal.more
+names(seasonal.stl.predict)=month.abb
+knitr::kable(t(seasonal.stl.predict),digits=4,caption = "南极海冰面积月周期项估计表")
+```
+
+### 4.2.3 随机项的拟合
+
+\qquad 检验随机项是否平稳
+```{r echo=FALSE, warning=FALSE}
+## 随机项建模
+err4=sisouth-si.pred
+adf.test(err4)
+
+```
+
+\qquad 拒绝原假设，可以认为序列平稳
+
+\qquad 可以利用auto.arima进行建模,模型参数及残差检验如下：
+
+```{r echo=FALSE, warning=FALSE}
+#利用auto.arima建模
+fit4 <- auto.arima(err4)
+fit4
+#图像观察法
+tsdiag(fit4)
+fit4.resi<-residuals(fit4,standardize=T)
+```
+
+对数据进行box-test和arch-test检验结果如图18
+
+![box-test和arch-test检验的结果](C:\Users\tbh32\Desktop\basoustl.png)
+
+\qquad 可见不存在arch效应，利用arima模型进行拟合，残差项随机性良好，可以进行应用。
+
+### 4.2.4 模型的预测
+
+\qquad 对上述模型预测如图19
+
+![南极海冰面积的LOESS模型预测图](C:\Users\tbh32\Desktop\forecastsou2.png)
+
+\qquad 计算其MSE为0.363085
+
+## 4.3 预测结果对比与模型评论
+
+```{r echo=FALSE, warning=FALSE}
+temmse=matrix(c(0.486908,0.363085),nrow=1,dimnames = list(c('MSE'),c('model1','model2')))
+knitr::kable(temmse)
+```
+
+\qquad 其中modeli分别表示南极海冰面积的基本分解模型和LOESS分解模型。由MSE可见LOESS分解模型要优于基本分解模型。
+
+\newpage
+\pagebreak
+
+# 5 全球平均温度的建模与预测
+
+```{r echo=FALSE, warning=FALSE,fig.showtext=TRUE}
+temdata=read.csv('C:/Users/tbh32/Desktop/climate-change-earth-surface-temperature-data/GlobalTemperatures.csv',header = TRUE)
+temall=temdata$LandAverageTemperature
+temall=ts(temall[1561:length(temall)],start = c(1880,1),frequency = 12)
+
+## 首先的首先留2年做预测
+tem=window(temall,start = c(1979,1),c(2013,12))
+
+#plot.ts(tem,ylab='全球平均温度℃')
+```
+
+## 5.1 时间序列基本分解模型
+
+### 5.1.1 趋势项T的估计
+
+\qquad 首先对tem进行趋势项分解，注意到时序图有一定趋势，利用一次函数拟合。
+
+```{r echo=FALSE, warning=FALSE}
+tem.remain=window(temall,start = c(2014,1),c(2015,12))
+## 拟合趋势项
+yy <- c(tem)
+tt <- seq(length(tem))
+lmr1 <- lm(yy ~ tt)
+summary(lmr1)
+```
+
+\qquad 没有通过显著性检验，用平均值估计趋势项
+
+### 5.1.2 周期项的估计
+
+\qquad 利用过去去除趋势项的数据中相同月份的均值作周期项的估计，从而得到下表中的数据：
+```{r echo=FALSE, warning=FALSE}
+## 去掉趋势项
+tr.more <- rep(mean(tem),444)
+tem.detrended = tem - tr.more[1:length(tem)]
+
+
+## 提取月周期项，并预测
+month0 = get.month(tem.detrended)
+months.more <- ts(rep(month0,length=444),
+                  start=start(tem), frequency=12)
+names(month0)=month.abb
+knitr::kable(t(month0),digits=4,caption = "全球平均温度月周期项估计表")
+```
+
+### 5.1.3 随机项的拟合
+
+\qquad 画出随机项的时序图
+
+```{r echo=FALSE, warning=FALSE,fig.showtext=TRUE}
+ymore <- ts(c(tem, rep(NA,12)), start=start(tem), frequency=12)
+
+err1=plot.month(tem.detrended,month0)
+
+plot.ts(err1,main='随机项的时序图')
+```
+
+\qquad 检验随机项是否平稳
+```{r echo=FALSE, warning=FALSE}
+adf.test(err1)
+```
+
+\qquad 拒绝原假设，可以认为随机项序列平稳。
+
+```{r echo=FALSE, warning=FALSE}
+#利用auto.arima建模
+fit1 <- auto.arima(err1)
+fit1
+tsdiag(fit1)
+```
+
+\qquad 对残差进行box-test和arch-test的检验,结果如图20
+
+![box-test和arch-test的检验结果](C:\Users\tbh32\Desktop\bttem.PNG)
+
+### 5.1.4 模型的预测
+
+\qquad 利用以上模型可以预测得到图21
+
+![全球平均温度的基本分解模型预测图](C:\Users\tbh32\Desktop\forecasttem1.png)
+
+\qquad 可以计算得其MSE为0.1092166
+
+## 5.2 LOESS分解模型
+
+\qquad 先对数据进行STL分解，结果如下图所示：
+
+```{r echo=FALSE, warning=FALSE}
+s1=stl(tem,s.window='periodic') #periodic是表示季节项恒定
+plot(s1)
+trand4=s1$time.series[,2]
+```
+
+### 5.2.1 趋势项T的估计    
+
+\qquad 在进行多项式拟合的过程中，发现二次曲线模型显著，利用其进行拟合。
+```{r echo=FALSE, warning=FALSE}
+#趋势项和周期项建模
+lm.stl.trend <- lm(trand4~tt+I(tt^2))
+summary(lm.stl.trend)
+```
+
+### 5.2.2 周期项的估计
+
+\qquad 利用过去去除趋势项的数据中相同月份的均值作周期项的估计，从而得到下表中的数据：
+
+```{r echo=FALSE, warning=FALSE}
+tr.more <- ts(predict(lm.stl.trend, newdata=list(tt=seq(length(tem)+24))),
+              frequency=12, start=c(1979,1))
+si.detrended = tem - tr.more[1:length(tem)]
+seasonal.stl.predict <- get.month(si.detrended)
+seasonal.more <- ts(rep(seasonal.stl.predict,length=444),
+                    start=start(tem), frequency=12)
+si.pred <- tr.more + seasonal.more
+names(seasonal.stl.predict)=month.abb
+knitr::kable(t(seasonal.stl.predict),digits=4,caption = "全球平均温度月周期项估计表")
+```
+
+### 5.2.3 随机项的拟合
+
+\qquad 随机项时序图见图22
+
+![全球平均温度的基本分解模型预测图](C:\Users\tbh32\Desktop\temerr.png)
+
+
+```{r echo=FALSE, warning=FALSE}
+## 随机项建模
+err4=tem-si.pred
+adf.test(err4)
+```
+
+\qquad 拒绝原假设，可以认为随机项序列平稳。
+
+```{r echo=FALSE, warning=FALSE}
+#利用auto.arima建模
+fit4 <- auto.arima(err4)
+fit4
+#图像观察法
+tsdiag(fit4)
+```
+
+\qquad 残差检验中第二张图的ACF.test显示残差没有明显的自相关。而Ljung-Box test显示所有P值都大于0.1，
+
+\qquad 下面对数据进行box-test和arch-test的检验，结果如图23.可见不存在arch效应，利用arma模型进行拟合，残差项通过了白噪声和arch检验，可以进行应用。
+
+![box-test和arch-test的检验结果](C:\Users\tbh32\Desktop\baloess.png)
+
+###5.2.4 模型的预测
+
+\qquad 利用以上模型可以预测得到图24,可以计算得其MSE为0.09610202
+
+![全球平均温度的LOESS分解模型预测图(实线真实值，虚线预测值)](C:\Users\tbh32\Desktop\forecasttem1.png)
+
+
+## 5.3 预测结果对比与模型评论
+
+```{r echo=FALSE, warning=FALSE}
+temmse=matrix(c(0.10922,0.09606),nrow=1,dimnames = list(c('MSE'),c('model1','model2')))
+knitr::kable(temmse)
+```
+
+\qquad 其中modeli分别表示温度的基本分解模型和LOESS分解模型。由MSE可见LOESS分解模型要优于基本分解模型。
+
+\newpage
+\pagebreak
+
+# 6 多元数据的VAR模型构建与预测
+
+\qquad 下面将南北极海冰面积和全球平均温度数据综合为一个多元时间序列，构建 P 阶的向量自回归模型（VAR）为：$$y_t=\alpha_1y_{t-1}+\cdots+\alpha_py_{t-p}+u_t$$
+
+## 6.1 模型滞后阶数的确定
+
+\qquad 使用vars包中的VARselect函数对全球温度，南北极海冰面积的多元时间序列定阶。三个信息准则的阶数如下表8：
+
+```{r,echo=FALSE}
+dat3=cbind(tem,sisouth,sinorth)
+dat4=ts(as.matrix(dat3), start=c(1979,1), frequency=12)
+vs=VARselect(y=dat4, lag.max = 10, type = 'both',season=12)
+knitr::kable(t(vs$selection),caption = "VAR信息准则")
+```
+
+\qquad 根据信息准则，判定VAR模型的滞后阶为2。
+
+## 6.2 拟合模型
+
+\qquad 使用vars包中的VAR函数对数据进行拟合，其拟合结果如下
+
+
+```{r echo=FALSE}
+var =  VAR(dat4 ,p = 2, type = "both",season=12)
+var
+```
+
+## 6.3 模型的诊断性检验
+
+\qquad 使用vars包中的stability函数进行稳定性检验，参数选择“OLS-CUSUM”（残差累积和），在该检验生成的曲线图(见图25)中，残差累积和曲线以时间为横坐标，图中绘出两条临界线，累积和未超出这两条临界线，则说明参数具有稳定性。
+
+![模型稳定性检验图](C:\Users\tbh32\Desktop\sta.png)
+
+\qquad Granger因果检验结果图如图26。
+
+![Granger因果检验结果图](C:\Users\tbh32\Desktop\granger.PNG)
+
+\qquad 从Granger检验结果来看，全球平均温度是南北极海冰变化的Granger原因，北极海冰是全球平均温度和南极海冰变化的Granger原因。由此我们也可以证实文章初的论点,即：全球平均温度的变化会直接作用于海冰大小，北极海冰在气候调节中的作用要比南极海冰更大，南极海冰不太受其余两者影响。
+
+## 6.4 脉冲响应分析
+
+### 6.4.1 来自全球平均温度的脉冲反应
+
+![全球平均温度对南北极海冰面积的冲击](C:\Users\tbh32\Desktop\globaltemirf.png)
+
+\qquad 全球平均温度对其他变量的冲击图见图27。可以看出，全球温度对南北极海冰面积都有不同程度的影响。其中南极海冰收到的影响在第二期开始加大，并在第四期达到最大后衰减趋于平稳。而北极海冰面积受的影响一开始为正，后快速变为负，并在第三期达到最大，而后开始衰减趋于平稳。所以，全球平均温度对海冰的面积以负向影响为主并慢慢趋于0。
+
+### 6.4.2 来自南极海冰的脉冲反应
+
+![南极海冰对其它变量的冲击](C:\Users\tbh32\Desktop\southsiirf.png)
+
+\qquad 南极海冰面积对其他变量的冲击图见图28。由图可见，南极海冰面积对其余两个变量的影响较小，对全球平均温度有些许负向作用，但随后快速衰减为0。 
+
+### 6.4.3 来自北极海冰的脉冲反应
+
+![北极海冰对其它变量的冲击](C:\Users\tbh32\Desktop\northsiirf.png)
+
+\qquad 北极海冰面积对其他变量的冲击图见图29。可以看到，北极海冰面积对全球平均温度和南极海冰面积都有影响。其中对全球平均温度以负向影响为主，但是很快趋于0。而对南极海冰面积一开始是正向影响，且影响比温度大，后转为负向影响并衰减为0。
+
+### 6.4.4 脉冲响应结果分析
+
+\qquad 全球平均温度影响南北极海冰面积，且脉冲持续效应时间较长，负影响表示海冰面积有缩小的趋势。北极海冰大小又反过来影响全球平均温度，其减少对温度上升有促进作用，并且由于环流等因素影响也会影响南极海冰的生成和融化，且影响很大与全球温度相当。而南极海冰对温度和北极海冰的影响都很小。
+
+## 6.5 预测与评估
+
+\qquad 接下来使用VAR模型预测接下来24期（即2013年到2015年两年）的数值。预测图见图30。
+
+![var模型对全球平均温度，南北极海冰面积的预测](C:\Users\tbh32\Desktop\predictofvar.jpg)
+
+\qquad 可以看出大致与原数据趋势相同，我们计算MSE得图31。
+
+![var模型预测的MSE](C:\Users\tbh32\Desktop\MSEVAR.jpg)
+
+\newpage
+\pagebreak
+
+# 7 总结
+
+\qquad 全球温度用VAR模型预测的MSE为0.09225231，略小于用LOESS分解模型预测的MSE0.09606。南极海冰面积用VAR模型预测的MSE为0.5199779，大于海冰面积的基本分解模型与LOESS分解模型。北极海冰面积用VAR模型预测的MSE为0.08172167，小于SARIMA模型的MSE，但大于基本分解模型与LOESS分解模型的MSE。我们猜想所用信息越多，预测就会更加准确，但VAR模型并没有体现出很大的优势。这可能是因为我们在用季节性VAR模型拟合时，对数据的残差项$u_t$并没有进行合理建模，而在对数据单独建立模型时，我们对时间序列的分解更加彻底，拟合得更加充分。也可能是因为一些变量，比如南极海冰面积，并没有表现出与其它变量很强的相关性，从而预测效果不好。
+
+\qquad 我们从Granger因果性的角度，初步验证了全球平均温度，南北极海冰面积之间的相关关系——全球平均温度是南北极海冰变化的Granger原因，北极海冰是全球平均温度和南极海冰变化的Granger原因。由此我们也可以证实文章初的论点,即：全球平均温度的变化会直接作用于海冰大小，北极海冰在气候调节中的作用要比南极海冰更大，南极海冰不太受其余两者影响。
+
